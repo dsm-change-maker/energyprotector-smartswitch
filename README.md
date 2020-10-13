@@ -1,1 +1,1 @@
-# energyprotector-smartswitch
+# 에너지 지킴이 스마트 플러그
