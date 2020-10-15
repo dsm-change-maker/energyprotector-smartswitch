@@ -2,6 +2,8 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WiFiMulti.h>
 
+// Wifi 세팅
+
 const char* ssid     = "ssid";
 const char* password = "password";
 const char* host = "host ip";
@@ -9,11 +11,19 @@ const uint16_t port = 7770;
 ESP8266WiFiMulti WiFiMulti;
 WiFiClient client;
 
+// 디바이스, 유닛 정의 
+
 #define UNIT_COUNT 3
 bool units_state[UNIT_COUNT] = {false};
+const int unit_control_pins[UNIT_COUNT] = {D1, D2, D3};
 const int unit_control_pins[UNIT_COUNT] = {D5, D6, D7};
 String device_id = "device_id_SW1";
 String device_type = "switch";
+String raspberry_id = "rasp_id_1"; //test
+String raspberry_group = "rasp_group_1"; //test
+volatile bool is_interrupted_0 = false;
+volatile bool is_interrupted_1 = false;
+volatile bool is_interrupted_2 = false;
 
 Servo servo1;
 Servo servo2;
@@ -23,6 +33,11 @@ int angle = 0;
 
 bool write_func(String data); //TCP 서버 요청 보냄
 String get_token(String data, int index); //토큰을 가져옴
+void toggle_unit_state(int n);
+ICACHE_RAM_ATTR void isr_button_0(); // isr_button_0 : button 0에 대한 인터럽트 서비스 루틴
+ICACHE_RAM_ATTR void isr_button_1(); // isr_button_1 : button 1에 대한 인터럽트 서비스 루틴
+ICACHE_RAM_ATTR void isr_button_2(); // isr_button_2 : button 2에 대한 인터럽트 서비스 루틴
+
 
 void setup() {
   Serial.begin(115200);
@@ -31,7 +46,16 @@ void setup() {
   for (i = 0; i < UNIT_COUNT; i++) {
     pinMode(unit_control_pins[i], OUTPUT);
   }
+  for (int i = 0; i < UNIT_COUNT; i++) {
+    pinMode(unit_toggle_button_pins[i], INPUT_PULLUP);
+  }
 
+  // Unit과 관련된 설정 - Interrupt
+  attachInterrupt(digitalPinToInterrupt(unit_toggle_button_pins[0]), isr_button_0, FALLING);
+  attachInterrupt(digitalPinToInterrupt(unit_toggle_button_pins[1]), isr_button_1, FALLING);
+  attachInterrupt(digitalPinToInterrupt(unit_toggle_button_pins[2]), isr_button_2, FALLING);
+  
+  
   // 와이파이 설정 및 연결 시작
   WiFi.mode(WIFI_STA);
   WiFiMulti.addAP(ssid, password);
@@ -97,7 +121,6 @@ void switch_on(int unitnum){
       delay(15);
     }
   }
-  
 }
 
 void switch_off(int unitnum){
@@ -135,10 +158,24 @@ void loop() {
       units_state[0] = on_off;
       Serial.print("[0] ON_OFF : ");
       Serial.println(on_off);
-    } else if (unit_index == "1") {
+    }
+    else if (unit_index == "1") {
       units_state[1] = on_off;
       Serial.print("[1] ON_OFF : ");
       Serial.println(on_off);
+    }
+    else if (unit_index == "2") {
+      units_state[2] = on_off;
+      Serial.print("[2] ON_OFF : ");
+      Serial.println(on_off);
+    }
+    else {
+      // 만약 unit_index가 허용 범위 외 라면
+      // req_err_data 패킷을 remote server로 전송함
+      String req_err_data = "NO;6;4;2;0;0;" + device_id + ";" + device_type + ";\n";
+      write_func(req_err_data);
+      Serial.println("req err");
+      return;
     }
     String req_ok_data = "OK;6;4;2;0;0;" + device_id + ";" + device_type + ";\n";
     write_func(req_ok_data);
@@ -146,11 +183,28 @@ void loop() {
     write_func(req_data_for_raspberry);
     Serial.print(req_data_for_raspberry + " & " + req_ok_data + " : ");
     Serial.println("req ok");
-
-    for(int i = 0; i< UNIT_COUNT; i++){
-      if (units_state[i]) switch_on(unit_control_pins[i]);
-      else switch_off(unit_control_pins[i]);
+  }
+  else {
+    if (is_interrupted_0) {
+      is_interrupted_0 = false;
+      toggle_unit_state(0);
+      Serial.println("Button 0 Clicked");
+    } 
+    else if (is_interrupted_1) {
+      is_interrupted_1 = false;
+      toggle_unit_state(1);
+      Serial.println("Button 1 Clicked");
     }
+    else if (is_interrupted_2) {
+      is_interrupted_2 = false;
+      toggle_unit_state(2);
+      Serial.println("Button 2 Clicked");
+    }
+  }
+
+  for(int i = 0; i< UNIT_COUNT; i++){
+    if (units_state[i]) switch_on(unit_control_pins[i]);
+    else switch_off(unit_control_pins[i]);
   }
 }
   /*********************************************/
@@ -187,4 +241,66 @@ String get_token(String data, int index) {
     }
   }
   return ret;
+}
+
+/*********************************************/
+/* toggle_unit_state(int) : unit state를 변화 */
+/* Return Type : void                        */
+/* Args - INT : unit index                   */
+/*                                           */
+/* n번째 Unit에 대한 상태를 Toggle하고          */
+/* 동기화를 위해 라즈베리파이에 신호를 전송함      */
+/*********************************************/
+void toggle_unit_state(int n) { 
+  // n의 허용 범위 밖일 경우, 동작을 수행하지 않고 종료.
+  if (n > 1 or n < 0) return;
+  String req_data_for_raspberry = "OK;8;4;3;";
+
+  units_state[n] = !units_state[n];
+  if (units_state[n]) {
+    if (n == 0) {
+      req_data_for_raspberry += "0;1;" + device_id + ";" + device_type + ";" + raspberry_id + ";" + raspberry_group + ";`REQ`\n"; 
+    } 
+    else if (n == 1) {
+      req_data_for_raspberry += "1;1;" + device_id + ";" + device_type + ";" + raspberry_id + ";" + raspberry_group + ";`REQ`\n"; 
+    }
+  } 
+  else {
+    if (n == 0) {
+      req_data_for_raspberry += "0;0;" + device_id + ";" + device_type + ";" + raspberry_id + ";" + raspberry_group + ";`REQ`\n"; 
+    } 
+    else if (n == 1) {
+      req_data_for_raspberry += "1;0;" + device_id + ";" + device_type + ";" + raspberry_id + ";" + raspberry_group + ";`REQ`\n"; 
+    }
+  }
+  
+  if (write_func(req_data_for_raspberry)) {
+    Serial.print(req_data_for_raspberry + " : ");
+    Serial.println("req ok"); 
+  } else {
+    // 동기화에 실패할 경우, Toggle 이전 상태로 만듦.
+    units_state[n] = !units_state[n];
+    Serial.println("request failed");
+  }
+}
+
+/*********************************************/
+/* isr_button_0 : Button 0에 대한 ISR         */
+/*********************************************/
+ICACHE_RAM_ATTR void isr_button_0() {
+  is_interrupted_0 = true;
+}
+
+/*********************************************/
+/* isr_button_1 : Button 1에 대한 ISR         */
+/*********************************************/
+ICACHE_RAM_ATTR void isr_button_1() {
+  is_interrupted_1 = true;
+}
+
+/*********************************************/
+/* isr_button_2 : Button 2에 대한 ISR         */
+/*********************************************/
+ICACHE_RAM_ATTR void isr_button_2() {
+  is_interrupted_2 = true;
 }
